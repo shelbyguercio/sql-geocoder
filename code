@@ -1,0 +1,286 @@
+/*
+Tiger Geocoder Walkthrough
+By Shelby Guercio
+Special thanks to Nick Dell'Osa and Dr. Michele Tobias (https://experimentalcraft.wordpress.com/2017/11/01/how-to-make-a-postgis-tiger-geocoder-in-less-than-5-days/), and Xiangui Dong (http://dracodoc.github.io/2015/11/19/Script-workflow/)
+
+Last updated: 12/20/2017
+
+Before you begin, make sure to have PostgreSQL 10, PostGIS 2.4.x bundle, wget, and 7zip downloaded and installed. 
+
+Make a staging folder on your drive called "gisdata". Within that folder, make another called "temp". Scripts created and data downloaded will be saved to these folders. 
+The paths will be used in the following commands. 
+*/
+
+--Create extensions
+/*
+CREATE EXTENSION postgis;
+CREATE EXTENSION fuzzystrmatch;
+CREATE EXTENSION postgis_tiger_geocoder;
+CREATE EXTENSION address_standardizer;
+
+--test
+SELECT na.address, na.streetname,na.streettypeabbrev, na.zip
+	FROM normalize_address('7 Carlson Road, Lake Ronkonkoma, NY 11779') AS na;
+*/
+
+--Update loader tables (make sure to set the paths and everything else to your paths and personal info)
+/*
+UPDATE loader_platform
+SET declare_sect = '
+set TMPDIR=C:\gisdata\temp
+set UNZIPTOOL="C:\Program Files\7-Zip\7z.exe"
+set WGETTOOL="C:\gisdata\wget\wget.exe"
+set PGBIN=C:\Program Files\PostgreSQL\10\bin\
+set PGPORT=5432
+set PGHOST=localhost
+set PGUSER=postgres
+set PGPASSWORD=password
+set PGDATABASE=geocoder
+set PSQL="C:\Program Files\PostgreSQL\10\bin\psql.exe"
+set SHP2PGSQL="C:\Program Files\PostgreSQL\10\bin\shp2pgsql.exe"
+cd C:\gisdata'
+WHERE os='windows'
+*/
+
+--Make & Run the Nation Script
+/*
+(IN COMMAND PROMPT)
+Create the nation script with the following: psql -U postgres -c "SELECT Loader_Generate_Nation_Script('windows')" -d geocoder -tA > C:/gisdata/nation_script_load.bat 
+Change the directory to your staging folder: cd C:/gisdata
+Run the script: nation_script_load.bat
+
+--Test in SQL
+SELECT count(*) FROM tiger_data.county_all; --Should return 1 row, with the value 3233
+SELECT count(*) FROM tiger_data.state_all; -- Should return 1 row, with the value 56
+*/
+
+--Make & Run State Scripts
+/*
+(IN COMMAND PROMPT)
+Create state script (can be any state): psql -U postgres -c "SELECT Loader_Generate_Script(ARRAY['PA'], 'windows')" -d geocoder -tA > C:/gisdata/pa_script_load.bat
+-- multiple states can be downloaded by separating with commas
+Change the directory to your staging folder: cd C:/gisdata
+Run the script: ca_script_load.bat
+*/
+
+--Analyze the data (whatever that means), run each of these separately
+/*
+SELECT install_missing_indexes();
+vacuum analyze verbose tiger.addr;
+vacuum analyze verbose tiger.edges;
+vacuum analyze verbose tiger.faces;
+vacuum analyze verbose tiger.featnames;
+vacuum analyze verbose tiger.place;
+vacuum analyze verbose tiger.cousub;
+vacuum analyze verbose tiger.county;
+vacuum analyze verbose tiger.state;
+vacuum analyze verbose tiger.zip_lookup_base;
+vacuum analyze verbose tiger.zip_state;
+vacuum analyze verbose tiger.zip_state_loc;
+*/
+
+-- Test it!!!!
+/*
+SELECT (addy).address As stno, 
+    (addy).streetname As street,
+	(addy).streettypeabbrev As styp, 
+    (addy).location As city, 
+    (addy).stateabbrev As st,
+    (addy).zip,
+    g.rating, 
+    g.geomout as geom,
+    ST_X(g.geomout)::numeric(8,5) AS lon,
+    ST_Y(g.geomout)::numeric(8,5) AS lat,
+    ST_AsText(ST_SnapToGrid(g.geomout,0.00001)) As wktlonlat
+FROM geocode('1813 Waterloo St, Philadelphia, PA 19122',1) As g;
+*/
+
+--TO BATCH GEOCODE!!!! (Thanks to dracodoc)
+/*
+-- prepare tables --
+DROP TABLE IF EXISTS address_table;
+CREATE TABLE address_table(
+	row_seq varchar(255), 
+	input_address varchar(255),
+	zip varchar(255) -- some input could be irregular or with leading 0
+*/
+
+/*
+ALTER TABLE tiger.test_addresses
+	ADD addid serial NOT NULL PRIMARY KEY,
+	ADD rating integer, -- -1 for no match, -2 for exception of geocode
+	ADD lon numeric,
+	ADD lat numeric,
+	ADD output_address text,
+	ADD geomout geometry,	-- a point geometry in NAD 83 long lat. 
+*/
+    
+/*
+--<< geocode function --
+    CREATE OR REPLACE FUNCTION geocode_sample(sample_size integer) 
+	RETURNS void AS $$
+DECLARE OUTPUT tiger.test_addresses%ROWTYPE;
+BEGIN
+UPDATE tiger.test_addresses
+  SET (rating, output_address, lon, lat, geomout)
+	= (COALESCE((g.geo).rating,-1), 
+	   pprint_addy((g.geo).addy),
+	   ST_X((g.geo).geomout)::numeric(8,5), 
+	   ST_Y((g.geo).geomout)::numeric(8,5),
+	   (g.geo).geomout
+	  )
+FROM (SELECT addid
+		FROM tiger.test_addresses
+		WHERE rating IS NULL
+		ORDER BY addid LIMIT sample_size
+	 ) AS a
+	LEFT JOIN (
+		SELECT sample.addid, geocode(sample.address,1) AS geo
+			FROM (SELECT addid, address
+					FROM test_addresses WHERE rating IS NULL
+					ORDER BY addid LIMIT sample_size
+				 ) AS sample
+			  ) AS g ON a.addid = g.addid
+WHERE a.addid = test_addresses.addid;
+
+EXCEPTION
+	WHEN OTHERS THEN
+		SELECT * INTO OUTPUT 
+			FROM test_addresses 
+			WHERE rating IS NULL ORDER BY addid LIMIT 1;
+		RAISE NOTICE '<address error> in samples started from: %', OUTPUT;
+		RAISE notice '-- !!! % % !!!--', SQLERRM, SQLSTATE;
+		UPDATE test_addresses
+			SET rating = -2
+		FROM (SELECT addid
+				FROM test_addresses 
+				WHERE rating IS NULL ORDER BY addid LIMIT sample_size
+			 ) AS sample
+		WHERE sample.addid = test_addresses.addid;
+END;
+$$ LANGUAGE plpgsql;
+-- geocode function >>--
+*/
+
+/*
+--<< census block function --
+CREATE OR REPLACE FUNCTION mapblock_sample(block_sample_size integer) 
+	RETURNS void AS $$
+DECLARE OUTPUT test_addresses%ROWTYPE;
+BEGIN
+UPDATE test_addresses
+	SET (tabblock_id, STATE, county, tractid)
+	  = (COALESCE(ab.tabblock_id,'FFFF'), 
+		 substring(ab.tabblock_id FROM 1 FOR 2),
+		 substring(ab.tabblock_id FROM 3 FOR 3),
+		 substring(ab.tabblock_id FROM 1 FOR 11)
+		)
+FROM
+	(SELECT addid
+		FROM test_addresses
+		WHERE (geomout IS NOT NULL) AND (tabblock_id IS NULL)
+		ORDER BY addid LIMIT block_sample_size
+	) AS a
+	LEFT JOIN (
+		SELECT a.addid, b.tabblock_id
+			FROM test_addresses AS a, tabblock AS b
+			WHERE (geomout IS NOT NULL) AND (a.tabblock_id IS NULL) 
+				AND ST_Contains(b.the_geom, ST_SetSRID(ST_Point(a.lon, a.lat), 4269))
+			ORDER BY addid LIMIT block_sample_size
+			  ) AS ab ON a.addid = ab.addid
+WHERE a.addid = test_addresses.addid; 
+-- even if no exception really happened, keep it here in case it does.
+EXCEPTION
+	WHEN OTHERS THEN
+		SELECT * INTO OUTPUT 
+			FROM test_addresses 
+			WHERE (geomout IS NOT NULL) AND (tabblock_id IS NULL) 
+			ORDER BY addid LIMIT 1; 
+		RAISE NOTICE '<census block> error in samples started from: %', OUTPUT;
+		RAISE notice '-- !!! % % !!!--', SQLERRM, SQLSTATE;
+		UPDATE test_addresses
+			SET tabblock_id = 'EEEE'
+		FROM (SELECT addid
+				FROM test_addresses
+				WHERE (geomout IS NOT NULL) AND (tabblock_id IS NULL)
+				ORDER BY addid LIMIT block_sample_size
+			 ) AS a
+		WHERE a.addid = test_addresses.addid;
+END;
+$$ LANGUAGE plpgsql;
+-- census block function >>--
+*/
+
+/*
+--<< main control --
+-- cannot replace function return type, need to drop first
+DROP FUNCTION IF EXISTS geocode_table(); -- only need to provide IN arg
+CREATE OR REPLACE FUNCTION geocode_table(
+	OUT table_size integer, 
+	OUT remaining_rows integer,
+	OUT total_time interval(0), 
+	OUT time_per_row interval(3)
+	) AS $func$
+DECLARE sample_size integer;
+DECLARE block_sample_size integer;
+DECLARE report_address_runs integer;-- sample size * runs, 100 * 1 = 100
+DECLARE report_block_runs integer;-- block size * runs, 100 * 10 = 1000
+DECLARE starting_time timestamp(0) WITH time ZONE;
+DECLARE time_stamp timestamp(0) WITH time ZONE;
+DECLARE time_passed interval(1);
+
+BEGIN
+	SELECT reltuples::bigint INTO table_size
+					FROM  pg_class
+					WHERE oid = 'tiger.test_addresses'::regclass;
+	starting_time := clock_timestamp();	
+	time_stamp := clock_timestamp(); 
+	RAISE notice '> % : Start on table of %', starting_time, table_size;
+	RAISE notice '> time passed | address processed <<<< address left';
+	sample_size := 1;
+	block_sample_size := 10;
+	report_address_runs := 100; -- modify this in debugging with small sample
+	report_block_runs := 100; -- modify this in debug with small sample
+	FOR i IN 1..(SELECT table_size / sample_size + 1) LOOP
+		PERFORM geocode_sample(sample_size);
+		-- s taken for 100 rows x 10 = ms/row.
+		IF i % report_address_runs = 0  THEN
+			SELECT count(*) INTO remaining_rows 
+				FROM test_addresses WHERE rating IS NULL;
+			time_passed := clock_timestamp() - time_stamp;
+			RAISE notice E'> %  |\t%\t<<<<\t%', 
+				time_passed, i * sample_size, remaining_rows;
+			time_stamp := clock_timestamp();
+		END IF;
+	END LOOP;
+	time_stamp := clock_timestamp();
+	RAISE notice '==== start mapping census block ====';
+	RAISE notice '# time passed | address to block <<<< address left';
+	FOR i IN 1..(SELECT table_size / block_sample_size + 1) LOOP
+		PERFORM mapblock_sample(block_sample_size);
+		IF i % report_block_runs = 0 THEN
+			SELECT count(*) INTO remaining_rows 
+				FROM test_addresses WHERE tabblock_id IS NULL;
+			time_passed := clock_timestamp() - time_stamp;
+			RAISE notice E'# %  |\t%\t<<<<\t%', 
+				time_passed, i * block_sample_size, remaining_rows;
+			time_stamp := clock_timestamp();
+		END IF;
+	END LOOP;
+	SELECT count(*) INTO remaining_rows 
+		FROM test_addresses WHERE rating IS NULL;
+	total_time := to_char(clock_timestamp() - starting_time, 'HH24:MI:SS'); 
+	time_per_row := to_char(total_time / table_size, 'HH24:MI:SS.MS'); 
+END
+$func$ LANGUAGE plpgsql;
+
+SELECT * FROM geocode_table();
+-- main control >>--
+*/
+
+/*
+SELECT * 
+FROM test_addresses;
+*/
+
+
